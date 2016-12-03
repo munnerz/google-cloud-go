@@ -141,10 +141,12 @@ import (
 	"google.golang.org/api/support/bundler"
 	"google.golang.org/api/transport"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 const (
 	httpHeader          = `X-Cloud-Trace-Context`
+	grpcMetadataKey     = `gcloud-trace-grpc-context`
 	userAgent           = `gcloud-golang-trace/20160501`
 	cloudPlatformScope  = `https://www.googleapis.com/auth/cloud-platform`
 	spanKindClient      = `RPC_CLIENT`
@@ -215,10 +217,25 @@ var EnableGRPCTracingDialOption grpc.DialOption = grpc.WithUnaryInterceptor(grpc
 // The functionality in gRPC that this relies on is currently experimental.
 var EnableGRPCTracing option.ClientOption = option.WithGRPCDialOption(EnableGRPCTracingDialOption)
 
+// EnableGRPCServerTracing enables tracing of requests for gRPC servers.
+// The functionality in gRPC that this relies on is currently experimental.
+func (client *Client) EnableGRPCServerTracing() grpc.ServerOption {
+	return grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+		span := client.spanFromGRPCContext(ctx, info.FullMethod)
+		resp, err = handler(NewContext(ctx, span), req)
+		if err != nil {
+			// TODO: standardize gRPC label names?
+			span.SetLabel("error", err.Error())
+		}
+		span.Finish()
+		return
+	})
+}
+
 func grpcUnaryInterceptor(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 	// TODO: also intercept streams.
 	span := FromContext(ctx).NewChild(method)
-	err := invoker(ctx, method, req, reply, cc, opts...)
+	err := invoker(newGRPCContext(ctx, span), method, req, reply, cc, opts...)
 	if err != nil {
 		// TODO: standardize gRPC label names?
 		span.SetLabel("error", err.Error())
@@ -331,6 +348,29 @@ func (client *Client) SpanFromRequest(r *http.Request) *Span {
 		localOptions:  options,
 	}
 	span := startNewChildWithRequest(r, t, parentSpanID)
+	return client.sampleSpan(span, hasTraceHeader)
+}
+
+func (client *Client) spanFromGRPCContext(ctx context.Context, name string) *Span {
+	if client == nil {
+		return nil
+	}
+	md, _ := metadata.FromContext(ctx)
+	traceID, parentSpanID, options, hasTraceHeader := traceInfoFromMetadata(md)
+	if !hasTraceHeader {
+		traceID = nextTraceID()
+	}
+	t := &trace{
+		traceID:       traceID,
+		client:        client,
+		globalOptions: options,
+		localOptions:  options,
+	}
+	span := startNewChild(name, t, parentSpanID)
+	return client.sampleSpan(span, hasTraceHeader)
+}
+
+func (client *Client) sampleSpan(span *Span, hasTraceHeader bool) *Span {
 	span.span.Kind = spanKindServer
 	span.rootSpan = true
 	if client.policy != nil {
@@ -362,15 +402,43 @@ func NewContext(ctx context.Context, s *Span) context.Context {
 	return context.WithValue(ctx, contextKey{}, s)
 }
 
+// newGRPCContext returns a derived context compatible with gRPC
+// containing tracing information
+func newGRPCContext(ctx context.Context, s *Span) context.Context {
+	if s == nil {
+		return ctx
+	}
+	md := metadata.New(map[string]string{grpcMetadataKey: spanHeader(s.trace.traceID, s.span.ParentSpanId, s.trace.globalOptions)})
+	parentMd, ok := metadata.FromContext(ctx)
+	if ok {
+		md = metadata.Join(md, parentMd)
+	}
+	return metadata.NewContext(ctx, md)
+}
+
 // FromContext returns the span contained in the context, or nil.
 func FromContext(ctx context.Context) *Span {
 	s, _ := ctx.Value(contextKey{}).(*Span)
 	return s
 }
 
+func traceInfoFromMetadata(md metadata.MD) (string, uint64, optionFlags, bool) {
+	if md == nil {
+		return "", 0, 0, false
+	}
+	str, _ := md[grpcMetadataKey]
+	if len(str) == 0 {
+		return "", 0, 0, false
+	}
+	return traceInfoFromString(str[0])
+}
+
 func traceInfoFromRequest(r *http.Request) (string, uint64, optionFlags, bool) {
 	// See https://cloud.google.com/trace/docs/faq for the header format.
-	h := r.Header.Get(httpHeader)
+	return traceInfoFromString(r.Header.Get(httpHeader))
+}
+
+func traceInfoFromString(h string) (string, uint64, optionFlags, bool) {
 	// Return if the header is empty or missing, or if the header is unreasonably
 	// large, to avoid making unnecessary copies of a large string.
 	if h == "" || len(h) > 200 {
